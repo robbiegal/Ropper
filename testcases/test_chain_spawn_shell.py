@@ -37,6 +37,57 @@ def _generator(arch):
     return RopChain.get([fc.loader], {fc.loader: fc.gadgets}, 'spawn_shell', None, b'')
 
 
+def _plt_deref(loader, stub):
+    """Independently (separate code path from _findPltStub) re-derive the GOT
+    slot the PLT entry at virtual address ``stub`` dereferences, so tests can
+    confirm resolution against ground truth.  Returns the slot VA or None."""
+    from capstone import Cs, CS_OP_MEM, CS_OP_IMM, CS_ARCH_ARM
+    arch = loader.arch
+    md = Cs(arch._arch, arch._mode)
+    md.detail = True
+    is_arm = (arch._arch == CS_ARCH_ARM)
+    section = None
+    for name in ('.plt.sec', '.plt', '.plt.got'):
+        try:
+            s = loader.getSection(name)
+        except BaseException:
+            continue
+        if s.virtualAddress <= stub < s.virtualAddress + len(s.bytes):
+            section = s
+            break
+    if section is None:
+        return None
+    code = bytes(bytearray(section.bytes))[stub - section.virtualAddress:][:48]
+
+    def ror32(v, r):
+        r &= 31
+        return v if r == 0 else ((v >> r) | (v << (32 - r))) & 0xffffffff
+
+    ip = None
+    for insn in md.disasm(code, stub):
+        ops = insn.operands
+        if is_arm:
+            if insn.mnemonic.startswith('add') and len(ops) >= 3 and md.reg_name(ops[0].reg) in ('ip', 'r12'):
+                imms = [o.imm & 0xffffffff for o in ops[2:] if o.type == CS_OP_IMM]
+                if not imms:
+                    continue
+                val = imms[0] if len(imms) == 1 else ror32(imms[0], imms[1])
+                if md.reg_name(ops[1].reg) in ('pc', 'r15'):
+                    ip = insn.address + 8 + val
+                elif ip is not None and md.reg_name(ops[1].reg) in ('ip', 'r12'):
+                    ip += val
+            elif insn.mnemonic.startswith('ldr') and ip is not None and md.reg_name(ops[0].reg) in ('pc', 'r15'):
+                return (ip + ops[1].mem.disp) & 0xffffffff
+        else:
+            if 'jmp' in insn.mnemonic and ops and ops[0].type == CS_OP_MEM:
+                bn = md.reg_name(ops[0].mem.base) if ops[0].mem.base else None
+                if bn == 'rip':
+                    return insn.address + insn.size + ops[0].mem.disp
+                if bn is None:
+                    return ops[0].mem.disp & 0xffffffff
+    return None
+
+
 class SpawnShellCommon(unittest.TestCase):
     """Architecture-agnostic guarantees, run for every supported arch."""
 
@@ -140,6 +191,48 @@ class SpawnShellResolvers(unittest.TestCase):
         for arch in _BINARIES:
             gen = _generator(arch)
             self.assertIsNone(gen._findExistingString('this string is not present zzz'), arch)
+
+
+class SpawnShellPltResolution(unittest.TestCase):
+    """Verified system@plt resolution (exercised via imported libc symbols,
+    since the bundled ls-* binaries import strlen/malloc/exit, not system)."""
+
+    def test_resolved_stub_dereferences_the_symbols_got_slot(self):
+        for arch in _BINARIES:
+            gen = _generator(arch)
+            loader = gen._binaries[0]
+            for sym in ('strlen', 'malloc', 'exit'):
+                got = gen._findImportGotSlot(sym)
+                stub = gen._findPltStub(sym)
+                self.assertIsNotNone(got, '%s/%s' % (arch, sym))
+                self.assertIsNotNone(stub, '%s/%s stub' % (arch, sym))
+                # Ground truth: the resolved stub must dereference exactly the
+                # relocation's GOT slot (re-derived by an independent path).
+                self.assertEqual(_plt_deref(loader, stub), got, '%s/%s deref' % (arch, sym))
+
+    def test_distinct_symbols_resolve_to_distinct_stubs(self):
+        for arch in _BINARIES:
+            gen = _generator(arch)
+            self.assertNotEqual(gen._findPltStub('strlen'), gen._findPltStub('malloc'), arch)
+
+    def test_non_imported_symbol_resolves_to_none(self):
+        for arch in _BINARIES:
+            gen = _generator(arch)
+            self.assertIsNone(gen._findPltStub('definitely_not_imported_zzz'), arch)
+
+    def test_system_resolves_via_plt_stub_when_imported(self):
+        # No bundled binary imports system(), so map system's GOT lookup onto an
+        # actually-imported symbol's slot and confirm _resolveSystemAddress
+        # emits a rebased system@plt (not a SYSTEM_ADDR placeholder).
+        for arch in _BINARIES:
+            gen = _generator(arch)
+            slot = gen._findImportGotSlot('strlen')
+            gen._findImportGotSlot = lambda nm, _s=slot: _s if nm == 'system' else None
+            line, defs = gen._resolveSystemAddress(None)
+            self.assertIn('system@plt', line, arch)
+            self.assertIn('rebase_', line, arch)
+            self.assertEqual('', defs, arch)
+            self.assertNotIn('SYSTEM_ADDR', line, arch)
 
 
 class SpawnShellRegression(unittest.TestCase):

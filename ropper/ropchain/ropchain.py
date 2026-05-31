@@ -171,6 +171,125 @@ class RopChain(Abstract):
             return None
         return None
 
+    def _findPltStub(self, name):
+        """Return the virtual address of the PLT stub for the imported symbol
+        ``name`` (i.e. ``name@plt`` -- the address a ret2plt chain jumps to), or
+        ``None``.
+
+        The stub is found by disassembling the binary's PLT sections and
+        locating the entry whose indirect jump *provably* dereferences
+        ``name``'s GOT slot.  Because the match is verified against the actual
+        relocation target, this never returns a silently-wrong address: if the
+        layout cannot be parsed (stripped PLT, x86 PIE ``jmp [ebx+off]`` whose
+        GOT base is unknown at rest, unsupported arch) it returns ``None`` and
+        the caller falls back to a hint + placeholder."""
+        got = self._findImportGotSlot(name)
+        if got is None:
+            return None
+        binary = self._binaries[0]
+        arch = getattr(binary, 'arch', None)
+        try:
+            from capstone import Cs, CS_OP_MEM, CS_OP_IMM, CS_ARCH_ARM
+            md = Cs(arch._arch, arch._mode)
+            md.detail = True
+        except BaseException:
+            return None
+
+        sections = []
+        for sname in ('.plt.sec', '.plt', '.plt.got'):
+            try:
+                sections.append(binary.getSection(sname))
+            except BaseException:
+                pass
+        if not sections:
+            return None
+
+        is_arm = (arch._arch == CS_ARCH_ARM)
+        for section in sections:
+            try:
+                code = bytes(bytearray(section.bytes))
+                if is_arm:
+                    stub = self._scanPltArm(md, code, section.virtualAddress, got, CS_OP_MEM, CS_OP_IMM)
+                else:
+                    stub = self._scanPltX86(md, code, section.virtualAddress, got, CS_OP_MEM)
+            except BaseException:
+                stub = None
+            if stub is not None:
+                return stub
+        return None
+
+    def _scanPltX86(self, md, code, base, got, CS_OP_MEM):
+        """Find an x86/x86_64 PLT entry whose ``jmp [mem]`` targets ``got``.
+        Returns the entry's virtual address (preferring the ``endbr`` landing
+        pad of a ``.plt.sec`` entry when present)."""
+        prev = None
+        for insn in md.disasm(code, base):
+            if 'jmp' in insn.mnemonic and insn.operands:
+                op = insn.operands[0]
+                if op.type == CS_OP_MEM:
+                    base_name = md.reg_name(op.mem.base) if op.mem.base else None
+                    target = None
+                    if base_name == 'rip':            # x86_64 RIP-relative
+                        target = insn.address + insn.size + op.mem.disp
+                    elif base_name is None:           # x86 absolute (non-PIE)
+                        target = op.mem.disp & 0xffffffff
+                    # base_name == 'ebx'/'rbx' (PIE) -> GOT base unknown, skip
+                    if target is not None and target == got:
+                        if (prev is not None and prev.mnemonic in ('endbr64', 'endbr32')
+                                and prev.address + prev.size == insn.address):
+                            return prev.address
+                        return insn.address
+            prev = insn
+        return None
+
+    def _armAddImmediate(self, ops, CS_OP_IMM):
+        """Value added by an ARM ``add`` immediate form.  GAS/capstone render a
+        rotated modified-immediate as two operands ``#imm, #rot`` (value =
+        ``imm`` rotated right by ``rot``, as the PLT's ``add ip, pc, #0, #12``);
+        a plain ``add ip, ip, #8`` has a single immediate operand."""
+        imms = [o.imm & 0xffffffff for o in ops[2:] if o.type == CS_OP_IMM]
+        if not imms:
+            return None
+        if len(imms) == 1:
+            return imms[0]
+        value, rot = imms[0], imms[1] & 31
+        if rot == 0:
+            return value
+        return ((value >> rot) | (value << (32 - rot))) & 0xffffffff
+
+    def _scanPltArm(self, md, code, base, got, CS_OP_MEM, CS_OP_IMM):
+        """Find an ARM PLT entry of the form
+        ``add ip, pc, #imm ; [add ip, ip, #imm ;] ldr pc, [ip, #imm]!`` whose
+        effective GOT dereference equals ``got``.  Returns the address of the
+        leading ``add ip, pc`` (the stub entry point)."""
+        IP = ('ip', 'r12')
+        PC = ('pc', 'r15')
+        ip = None
+        entry_start = None
+        for insn in md.disasm(code, base):
+            m = insn.mnemonic
+            ops = insn.operands
+            if (m.startswith('add') and len(ops) >= 3
+                    and md.reg_name(ops[0].reg) in IP):
+                src = md.reg_name(ops[1].reg)
+                val = self._armAddImmediate(ops, CS_OP_IMM)
+                if val is None:
+                    ip, entry_start = None, None
+                elif src in PC:                       # ARM PC reads as addr + 8
+                    ip = insn.address + 8 + val
+                    entry_start = insn.address
+                elif src in IP and ip is not None:
+                    ip += val
+                else:
+                    ip, entry_start = None, None
+            elif m.startswith('ldr') and ip is not None and ops:
+                if (md.reg_name(ops[0].reg) in PC and len(ops) > 1
+                        and ops[1].type == CS_OP_MEM and md.reg_name(ops[1].mem.base) in IP):
+                    if ((ip + ops[1].mem.disp) & 0xffffffff) == got and entry_start is not None:
+                        return entry_start
+                ip, entry_start = None, None
+        return None
+
     def _findExistingString(self, text):
         """Return the virtual address of an existing occurrence of ``text`` in
         the primary binary, or ``None``."""
@@ -285,10 +404,17 @@ class RopChain(Abstract):
             self._printMessage('Resolved system() from symbol table at %s' % toHex(sym, width))
             return (self._rebaseLine(sym, 'system()'), '')
 
+        plt = self._findPltStub('system')
+        if plt is not None:
+            self._printMessage('Resolved system@plt at %s (verified against its GOT slot).'
+                               % toHex(plt, width))
+            return (self._rebaseLine(plt, 'system@plt'), '')
+
         got = self._findImportGotSlot('system')
         if got is not None:
-            self._printMessage('system() is imported via PLT (GOT slot at %s).' % toHex(got, width))
-            self._printMessage('Pass address=<runtime libc system()> or its PLT stub address.')
+            self._printMessage('system() is imported via PLT (GOT slot at %s) but its stub '
+                               'could not be auto-resolved.' % toHex(got, width))
+            self._printMessage('Pass address=<runtime libc system() or system@plt>.')
             defs = ('SYSTEM_ADDR = 0xdeadbeef # TODO: libc system() '
                     '(imported via PLT; GOT slot at %s)\n' % toHex(got, width))
             return ('rop += p(SYSTEM_ADDR)\n', defs)
